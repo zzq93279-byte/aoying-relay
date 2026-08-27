@@ -78,6 +78,24 @@ async function posDiag() {
   return out.join("\n\n----\n\n");
 }
 
+async function rawDetail() {
+  const paths = [
+    "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/detail",
+    "bapi/futures/v1/public/future/copy-trade/lead-portfolio/detail"
+  ];
+  const out = [];
+  for (const p of paths) {
+    try {
+      const r = await fetch(HOST + p + "?portfolioId=" + PID, { method: "GET", headers: H });
+      const t = await r.text();
+      out.push("GET " + r.status + " | " + p + "\n" + t);
+    } catch (e) {
+      out.push("ERR | " + p + " | " + e.message);
+    }
+  }
+  return out.join("\n\n====\n\n");
+}
+
 async function grabHistory() {
   const r = await fetch(HOST + HIST_EP, {
     method: "POST", headers: H,
@@ -262,6 +280,7 @@ http.createServer(async (req, res) => {
   const send = (b, t) => { res.writeHead(200, { "content-type": t + "; charset=utf-8" }); res.end(b); };
   try {
     if (p === "/posdiag") return send(await posDiag(), "text/plain");
+    if (p === "/rawdetail") return send(await rawDetail(), "text/plain");
     if (p === "/test") return send(JSON.stringify(await run(true), null, 2), "application/json");
     if (p === "/check") return send(JSON.stringify(await run(false), null, 2), "application/json");
     send("ok. /test 测试  /check 检查一次", "text/plain");

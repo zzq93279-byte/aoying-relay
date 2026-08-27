@@ -51,6 +51,33 @@ async function grabPositions() {
   return list(d);
 }
 
+async function posDiag() {
+  const candidates = [
+    { m: "GET", p: "bapi/futures/v1/public/future/copy-trade/lead-data/positions" },
+    { m: "GET", p: "bapi/futures/v1/friendly/future/copy-trade/lead-data/positions" },
+    { m: "GET", p: "bapi/futures/v1/public/future/copy-trade/lead-portfolio/positions" },
+    { m: "GET", p: "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/positions" },
+    { m: "POST", p: "bapi/futures/v1/public/future/copy-trade/lead-data/positions" },
+    { m: "POST", p: "bapi/futures/v1/friendly/future/copy-trade/lead-data/positions" },
+    { m: "GET", p: "bapi/futures/v1/public/future/copy-trade/lead-data/position" },
+    { m: "GET", p: "bapi/futures/v1/friendly/future/copy-trade/lead-data/position" }
+  ];
+  const out = [];
+  for (const c of candidates) {
+    try {
+      const url = HOST + c.p + (c.m === "GET" ? "?portfolioId=" + PID : "");
+      const opt = { method: c.m, headers: H };
+      if (c.m === "POST") opt.body = JSON.stringify({ portfolioId: PID, pageNumber: 1, pageSize: 20 });
+      const r = await fetch(url, opt);
+      const t = await r.text();
+      out.push(c.m + " " + r.status + " | " + c.p + "\n" + t.slice(0, 400));
+    } catch (e) {
+      out.push(c.m + " ERR | " + c.p + " | " + e.message);
+    }
+  }
+  return out.join("\n\n----\n\n");
+}
+
 async function grabHistory() {
   const r = await fetch(HOST + HIST_EP, {
     method: "POST", headers: H,
@@ -234,6 +261,7 @@ http.createServer(async (req, res) => {
   const p = req.url.split("?")[0];
   const send = (b, t) => { res.writeHead(200, { "content-type": t + "; charset=utf-8" }); res.end(b); };
   try {
+    if (p === "/posdiag") return send(await posDiag(), "text/plain");
     if (p === "/test") return send(JSON.stringify(await run(true), null, 2), "application/json");
     if (p === "/check") return send(JSON.stringify(await run(false), null, 2), "application/json");
     send("ok. /test 测试  /check 检查一次", "text/plain");

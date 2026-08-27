@@ -1,15 +1,15 @@
 const http = require("http");
 
-// 如果 Render 环境变量未读到，默认使用该 PID（请确保填写正确）
-const PID = process.env.PID || "4458313881518349569"; // ← 如果有默认PID可填在此处
+// 如果 Render 环境变量未读到，默认使用熬鹰资本的 PID
+const PID = process.env.PID || "5075281354358777856";
 const TOKEN = process.env.TOKEN;
 const CHAT = process.env.CHAT;
 const NAME = process.env.NAME || "熬鹰资本";
 const PORT = process.env.PORT || 10000;
 
 const DASHBOARD_URL = "https://binance-leader-tracker.cyanbin96.workers.dev/";
-
 const HOST = "https://www.binance.com/";
+
 const H = {
   "content-type": "application/json",
   "accept": "*/*",
@@ -42,25 +42,31 @@ async function grabAllData() {
   }
 
   try {
-    const reqDetail = fetch(HOST + "bapi/futures/v1/public/future/copy-trade/lead-portfolio/detail", {
-      method: "POST", headers: H, body: JSON.stringify({ portfolioId: PID })
-    });
-    const reqPositions = fetch(HOST + "bapi/futures/v1/public/future/copy-trade/lead-portfolio/position-list", {
+    // 关键修复：detail 接口必须用 GET 请求并拼在 URL 后面
+    const detailUrl = `${HOST}bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/detail?portfolioId=${PID}`;
+    const reqDetail = fetch(detailUrl, { method: "GET", headers: H });
+
+    // position-list 接口保持 POST 请求
+    const posUrl = `${HOST}bapi/futures/v1/public/future/copy-trade/lead-portfolio/position-list`;
+    const reqPositions = fetch(posUrl, {
       method: "POST", headers: H, body: JSON.stringify({ portfolioId: PID })
     });
 
     const [resDetail, resPositions] = await Promise.all([reqDetail, reqPositions]);
-    
-    const detailJson = await resDetail.json();
-    const posJson = await resPositions.json();
 
-    if (detailJson.code !== "000000" && detailJson.message) {
-      return { error: `币安API返回异常: ${detailJson.message} (${detailJson.code})` };
-    }
+    const detailText = await resDetail.text();
+    const posText = await resPositions.text();
+
+    let detailJson = {}, posJson = {};
+    try { detailJson = JSON.parse(detailText); } catch (e) {}
+    try { posJson = JSON.parse(posText); } catch (e) {}
+
+    const detailData = detailJson.data || {};
+    const posData = posJson.data || [];
 
     return {
-      detail: detailJson.data || {},
-      positions: posJson.data || []
+      detail: detailData,
+      positions: posData
     };
   } catch (err) {
     return { error: `网络请求失败: ${err.message}` };
@@ -69,20 +75,26 @@ async function grabAllData() {
 
 function buildFullMessage(data) {
   if (data.error) {
-    return `⚠️ <b>【${NAME}】监控告警</b>\n\n<b>数据获取失败：</b> ${data.error}\n<i>请检查 Render 的 PID 环境变量设置。</i>`;
+    return `⚠️ <b>【${NAME}】监控告警</b>\n\n<b>数据获取失败：</b> ${data.error}`;
   }
 
   const d = data.detail;
   const posList = data.positions;
+
+  // 提取带单员基础信息
+  const marginBalance = g(d, "marginBalance", "balance", "portfolioBalance");
+  const aum = g(d, "aum", "aumAmount");
+  const followerCount = g(d, "currentFollowerCount", "currentCopyCount") || "--";
+  const maxFollower = g(d, "maxFollowerCount", "maxCopyCount") || "--";
 
   let text = `🦅 <b>【${NAME}】全要素持仓与实时监控</b>\n`;
   text += `推送时间：${T(Date.now())}\n\n`;
 
   text += `📌 <b>一、 账户总览</b>\n`;
   text += `--------------------------------\n`;
-  text += `• <b>带单余额：</b> ${fN(d.marginBalance)} USDT\n`;
-  text += `• <b>管理规模 (AUM)：</b> ${fN(d.aum)} USDT\n`;
-  text += `• <b>跟单人数：</b> ${d.currentFollowerCount || "--"}/${d.maxFollowerCount || "--"}\n\n`;
+  text += `• <b>带单余额：</b> ${fN(marginBalance)} USDT\n`;
+  text += `• <b>管理规模 (AUM)：</b> ${fN(aum)} USDT\n`;
+  text += `• <b>跟单人数：</b> ${followerCount}/${maxFollower}\n\n`;
 
   text += `📈 <b>二、 持有仓位明细 (${posList.length}个)</b>\n`;
   text += `--------------------------------\n`;

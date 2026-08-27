@@ -5,8 +5,8 @@ const TOKEN = process.env.TOKEN;
 const CHAT = process.env.CHAT;
 const NAME = process.env.NAME || "带单";
 const EP = process.env.EP || "";
-const POS_EP = process.env.POS_EP || "bapi/futures/v1/public/future/copy-trade/lead-data/positions";
 const HIST_EP = process.env.HIST_EP || "bapi/futures/v1/public/future/copy-trade/lead-portfolio/position-history";
+const DETAIL_EP = "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/detail";
 const WINDOW_MS = 4 * 60 * 1000;
 
 const HOST = "https://www.binance.com/";
@@ -31,11 +31,11 @@ function list(d) {
   return d.list || d.rows || d.records || d.positions || [];
 }
 
-async function grabTrades() {
+async function grabTrades(pageSize) {
   const path = EP || DEF;
   const r = await fetch(HOST + path, {
     method: "POST", headers: H,
-    body: JSON.stringify({ portfolioId: PID, pageNumber: 1, pageSize: 20 })
+    body: JSON.stringify({ portfolioId: PID, pageNumber: 1, pageSize: pageSize || 20 })
   });
   const t = await r.text();
   if (!t.trim().startsWith("{")) throw new Error("HTTP " + r.status + " 非JSON");
@@ -43,57 +43,12 @@ async function grabTrades() {
   return { arr: list(d), path };
 }
 
-async function grabPositions() {
-  const r = await fetch(HOST + POS_EP + "?portfolioId=" + PID, { method: "GET", headers: H });
+async function grabDetail() {
+  const r = await fetch(HOST + DETAIL_EP + "?portfolioId=" + PID, { method: "GET", headers: H });
   const t = await r.text();
-  if (!t.trim().startsWith("{") && !t.trim().startsWith("[")) throw new Error("HTTP " + r.status + " 非JSON");
-  const j = JSON.parse(t), d = j.data ?? j;
-  return list(d);
-}
-
-async function posDiag() {
-  const candidates = [
-    { m: "GET", p: "bapi/futures/v1/public/future/copy-trade/lead-data/positions" },
-    { m: "GET", p: "bapi/futures/v1/friendly/future/copy-trade/lead-data/positions" },
-    { m: "GET", p: "bapi/futures/v1/public/future/copy-trade/lead-portfolio/positions" },
-    { m: "GET", p: "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/positions" },
-    { m: "POST", p: "bapi/futures/v1/public/future/copy-trade/lead-data/positions" },
-    { m: "POST", p: "bapi/futures/v1/friendly/future/copy-trade/lead-data/positions" },
-    { m: "GET", p: "bapi/futures/v1/public/future/copy-trade/lead-data/position" },
-    { m: "GET", p: "bapi/futures/v1/friendly/future/copy-trade/lead-data/position" }
-  ];
-  const out = [];
-  for (const c of candidates) {
-    try {
-      const url = HOST + c.p + (c.m === "GET" ? "?portfolioId=" + PID : "");
-      const opt = { method: c.m, headers: H };
-      if (c.m === "POST") opt.body = JSON.stringify({ portfolioId: PID, pageNumber: 1, pageSize: 20 });
-      const r = await fetch(url, opt);
-      const t = await r.text();
-      out.push(c.m + " " + r.status + " | " + c.p + "\n" + t.slice(0, 400));
-    } catch (e) {
-      out.push(c.m + " ERR | " + c.p + " | " + e.message);
-    }
-  }
-  return out.join("\n\n----\n\n");
-}
-
-async function rawDetail() {
-  const paths = [
-    "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/detail",
-    "bapi/futures/v1/public/future/copy-trade/lead-portfolio/detail"
-  ];
-  const out = [];
-  for (const p of paths) {
-    try {
-      const r = await fetch(HOST + p + "?portfolioId=" + PID, { method: "GET", headers: H });
-      const t = await r.text();
-      out.push("GET " + r.status + " | " + p + "\n" + t);
-    } catch (e) {
-      out.push("ERR | " + p + " | " + e.message);
-    }
-  }
-  return out.join("\n\n====\n\n");
+  if (!t.trim().startsWith("{")) throw new Error("HTTP " + r.status + " 非JSON");
+  const j = JSON.parse(t);
+  return j.data ?? {};
 }
 
 async function grabHistory() {
@@ -105,6 +60,14 @@ async function grabHistory() {
   if (!t.trim().startsWith("{")) throw new Error("HTTP " + r.status + " 非JSON");
   const j = JSON.parse(t), d = j.data ?? j;
   return list(d);
+}
+
+async function getMark(symbol) {
+  try {
+    const r = await fetch("https://fapi.binance.com/fapi/v1/ticker/price?symbol=" + symbol);
+    const j = await r.json();
+    return N(j.price);
+  } catch (e) { return null; }
 }
 
 function T(v) {
@@ -129,8 +92,7 @@ function isLongSide(o) {
   if (ps && ps !== "BOTH") return ps.includes("LONG");
   const sd = String(g(o, "side", "orderSide") || "").toUpperCase();
   if (sd) return sd === "BUY";
-  const amt = N(g(o, "positionAmount", "positionAmt", "amount", "qty"));
-  return amt == null ? true : amt >= 0;
+  return true;
 }
 function isOpenTrade(t) {
   if (g(t, "isOpen", "open") != null) return !!g(t, "isOpen", "open");
@@ -152,42 +114,6 @@ function lineTrade(t) {
     "\n" + T(g(t, "time", "tradeTime", "updateTime", "createTime"));
 }
 
-function posDetail(p) {
-  const sym = g(p, "symbol", "symbolName") || "?";
-  const base = String(sym).replace(/USDT$|USDC$|BUSD$/, "");
-  const lg = isLongSide(p);
-  const amt = g(p, "positionAmount", "positionAmt", "amount", "qty");
-  const entry = g(p, "entryPrice", "avgPrice", "openPrice", "costPrice");
-  const mark = g(p, "markPrice", "currentPrice", "price");
-  let notional = g(p, "notionalValue", "notional", "positionValue");
-  if (notional == null && N(amt) != null && N(mark) != null) notional = Math.abs(N(amt) * N(mark));
-  const margin = g(p, "collateral", "isolatedMargin", "positionInitialMargin", "margin");
-  const upnl = g(p, "unrealizedProfit", "unrealizedPnl", "unRealizedProfit", "pnl");
-  let roi = g(p, "roi", "returnRate", "pnlRatio", "unrealizedRoe");
-  if (roi == null && N(upnl) != null && N(margin)) roi = N(upnl) / N(margin);
-  let lev = g(p, "leverage", "estimatedLeverage");
-  if (lev == null && notional != null && N(margin)) lev = N(notional) / N(margin);
-  const liq = g(p, "liquidationPrice", "estimatedLiquidationPrice", "liqPrice");
-  const openTime = g(p, "openTime", "updateTime", "time", "createTime");
-  let marginRatio = g(p, "marginRatio", "maintainMarginRatio");
-  if (marginRatio == null && N(margin) != null && notional != null && N(notional) > 0) {
-    marginRatio = N(margin) / N(notional);
-  }
-
-  return (lg ? "🟢 多  " : "🔴 空  ") + sym +
-    "\n持仓量(" + base + ") " + fD(Math.abs(N(amt) || 0), 2) +
-    "\n持仓均价 " + fD(entry) +
-    "\n标记价格 " + fD(mark) +
-    "\n名义价值 " + fM(notional) + " USDT" +
-    "\n保证金 " + fM(margin) + " USDT" +
-    "\n保证金比率 " + fPct(marginRatio) +
-    "\n未实现盈亏 " + fSigned(upnl) + " USDT" +
-    "\n回报率 " + fPct(roi) +
-    "\n推算杠杆 " + (lev != null ? fD(lev, 2) + "x" : "--") +
-    "\n预估强平价 " + fD(liq) +
-    "\n开仓时间 " + T(openTime);
-}
-
 function histDetail(h) {
   const sym = g(h, "symbol", "symbolName") || "?";
   const lg = isLongSide(h);
@@ -204,6 +130,72 @@ function histDetail(h) {
     "\n平仓时间 " + T(closeT);
 }
 
+function netPosition(trades) {
+  let qty = 0, avgPrice = null, openTime = null;
+  for (const t of trades) {
+    const price = N(g(t, "price", "avgPrice", "averagePrice"));
+    const tqty = Math.abs(N(g(t, "quantity", "qty", "amount", "executedQty")) || 0);
+    if (!tqty || price == null) continue;
+    const lg = isLongSide(t), op = isOpenTrade(t);
+    const dir = lg ? 1 : -1;
+    const delta = op ? dir * tqty : -dir * tqty;
+    const newQty = qty + delta;
+    if (qty === 0 || Math.sign(qty) === Math.sign(delta)) {
+      const cost = (avgPrice || 0) * Math.abs(qty) + price * tqty;
+      qty = newQty;
+      avgPrice = qty !== 0 ? cost / Math.abs(qty) : null;
+      if (openTime == null) openTime = g(t, "time", "tradeTime", "updateTime", "createTime");
+    } else if (Math.sign(newQty) === Math.sign(qty) || newQty === 0) {
+      qty = newQty;
+      if (qty === 0) { avgPrice = null; openTime = null; }
+    } else {
+      qty = newQty; avgPrice = price;
+      openTime = g(t, "time", "tradeTime", "updateTime", "createTime");
+    }
+  }
+  return { qty, avgPrice, openTime };
+}
+
+function computeAllPositions(trades) {
+  const bySymbol = {};
+  for (const t of trades) {
+    const s = g(t, "symbol", "symbolName"); if (!s) continue;
+    (bySymbol[s] = bySymbol[s] || []).push(t);
+  }
+  const out = [];
+  for (const s in bySymbol) {
+    const arr = bySymbol[s].slice().reverse();
+    const pos = netPosition(arr);
+    if (pos.qty && Math.abs(pos.qty) > 1e-9) out.push({ symbol: s, ...pos });
+  }
+  return out;
+}
+
+async function posDetailComputed(pos, marginBalance) {
+  const mark = await getMark(pos.symbol);
+  const lg = pos.qty > 0;
+  const base = pos.symbol.replace(/USDT$|USDC$|BUSD$/, "");
+  const notional = mark != null ? Math.abs(pos.qty) * mark : null;
+  const upnl = (mark != null && pos.avgPrice != null) ? (mark - pos.avgPrice) * pos.qty : null;
+  const margin = N(marginBalance);
+  const roi = (upnl != null && margin) ? upnl / margin : null;
+  const lev = (notional != null && margin) ? notional / margin : null;
+  const marginRatio = (margin != null && notional) ? margin / notional : null;
+
+  return (lg ? "🟢 多  " : "🔴 空  ") + pos.symbol +
+    "\n持仓量(" + base + ") " + fD(Math.abs(pos.qty), 2) +
+    "\n持仓均价 " + fD(pos.avgPrice) +
+    "\n标记价格 " + fD(mark) +
+    "\n名义价值 " + fM(notional) + " USDT" +
+    "\n保证金 " + fM(margin) + " USDT（全仓，账户共用）" +
+    "\n保证金比率 " + fPct(marginRatio) +
+    "\n未实现盈亏 " + fSigned(upnl) + " USDT" +
+    "\n回报率 " + fPct(roi) +
+    "\n推算杠杆 " + (lev != null ? fD(lev, 2) + "x" : "--") +
+    "\n预估强平价 --（全仓无法精确推算）" +
+    "\n开仓时间 " + T(pos.openTime);
+}
+
 async function push(text) {
   const r = await fetch("https://api.telegram.org/bot" + TOKEN + "/sendMessage", {
     method: "POST",
@@ -214,7 +206,7 @@ async function push(text) {
 }
 
 async function run(force) {
-  const { arr: trades, path } = await grabTrades();
+  const { arr: trades, path } = await grabTrades(100);
   const cut = Date.now() - WINDOW_MS;
   const fresh = trades.filter(t => {
     let x = N(g(t, "time", "tradeTime", "updateTime", "createTime"));
@@ -224,18 +216,24 @@ async function run(force) {
   });
 
   if (force) {
-    let posArr = [], posErr = null;
-    try { posArr = await grabPositions(); } catch (e) { posErr = e.message; }
+    let detail = {}, detailErr = null;
+    try { detail = await grabDetail(); } catch (e) { detailErr = e.message; }
+    const positions = computeAllPositions(trades);
     let msg = "连接正常（新加坡节点）\n路径 " + path + "\n\n";
-    if (posArr.length) {
-      msg += "当前持仓 (" + posArr.length + ")\n\n" + posArr.map(posDetail).join("\n\n———\n\n");
-    } else if (posErr) {
-      msg += "持仓接口出错: " + posErr + "\n\n最近一笔成交:\n" + (trades.length ? lineTrade(trades[0]) : "无记录");
+    if (detail.nickname) {
+      msg += "带单余额 " + fM(detail.marginBalance) + " USDT\n" +
+        "资产管理规模 " + fM(detail.aumAmount) + " USDT\n" +
+        "跟单用户 " + detail.currentCopyCount + "/" + detail.maxCopyCount + "\n\n";
+    }
+    if (positions.length) {
+      const parts = [];
+      for (const pos of positions) parts.push(await posDetailComputed(pos, detail.marginBalance));
+      msg += "当前持仓 (" + positions.length + ")\n\n" + parts.join("\n\n———\n\n");
     } else {
       msg += "当前空仓\n\n最近一笔成交:\n" + (trades.length ? lineTrade(trades[0]) : "无记录");
     }
     const tg = await push(msg);
-    return { ok: 1, path, total: trades.length, fresh: fresh.length, positions: posArr.length, tg };
+    return { ok: 1, path, total: trades.length, fresh: fresh.length, positions: positions.length, detailErr, tg };
   }
 
   if (!fresh.length) return { ok: 1, path, total: trades.length, fresh: 0 };
@@ -245,14 +243,15 @@ async function run(force) {
   const parts = [];
 
   if (opens.length) {
-    let posArr = [];
-    try { posArr = await grabPositions(); } catch (e) {}
+    let detail = {};
+    try { detail = await grabDetail(); } catch (e) {}
+    const positions = computeAllPositions(trades);
     const symbols = [...new Set(opens.map(t => g(t, "symbol", "symbolName")))];
     for (const s of symbols) {
-      const p = posArr.find(x => g(x, "symbol", "symbolName") === s);
+      const p = positions.find(x => x.symbol === s);
       parts.push(p
-        ? ("🟢 新开仓 / 加仓\n\n" + posDetail(p))
-        : ("🟢 新开仓 " + s + "（详情获取失败）\n" + opens.filter(t => g(t, "symbol", "symbolName") === s).map(lineTrade).join("\n")));
+        ? ("🟢 新开仓 / 加仓\n\n" + await posDetailComputed(p, detail.marginBalance))
+        : ("🟢 新开仓 " + s + "\n" + opens.filter(t => g(t, "symbol", "symbolName") === s).map(lineTrade).join("\n")));
     }
   }
 
@@ -264,7 +263,7 @@ async function run(force) {
       const h = hist.find(x => g(x, "symbol", "symbolName") === s);
       parts.push(h
         ? ("🔴 平仓\n\n" + histDetail(h))
-        : ("🔴 平仓 " + s + "（详情获取失败）\n" + closes.filter(t => g(t, "symbol", "symbolName") === s).map(lineTrade).join("\n")));
+        : ("🔴 平仓 " + s + "\n" + closes.filter(t => g(t, "symbol", "symbolName") === s).map(lineTrade).join("\n")));
     }
   }
 
@@ -279,8 +278,6 @@ http.createServer(async (req, res) => {
   const p = req.url.split("?")[0];
   const send = (b, t) => { res.writeHead(200, { "content-type": t + "; charset=utf-8" }); res.end(b); };
   try {
-    if (p === "/posdiag") return send(await posDiag(), "text/plain");
-    if (p === "/rawdetail") return send(await rawDetail(), "text/plain");
     if (p === "/test") return send(JSON.stringify(await run(true), null, 2), "application/json");
     if (p === "/check") return send(JSON.stringify(await run(false), null, 2), "application/json");
     send("ok. /test 测试  /check 检查一次", "text/plain");

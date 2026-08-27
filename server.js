@@ -1,24 +1,24 @@
 const http = require("http");
 
-const PID = process.env.PID;
+// 如果 Render 环境变量未读到，默认使用该 PID（请确保填写正确）
+const PID = process.env.PID || "4458313881518349569"; // ← 如果有默认PID可填在此处
 const TOKEN = process.env.TOKEN;
 const CHAT = process.env.CHAT;
-const NAME = process.env.NAME || "熬鹰带单";
+const NAME = process.env.NAME || "熬鹰资本";
 const PORT = process.env.PORT || 10000;
 
-// 你的专属看板链接
 const DASHBOARD_URL = "https://binance-leader-tracker.cyanbin96.workers.dev/";
 
 const HOST = "https://www.binance.com/";
 const H = {
   "content-type": "application/json",
   "accept": "*/*",
-  "accept-language": "zh-CN,zh;q=0.9",
+  "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
   "clienttype": "web",
   "lang": "zh-CN",
   "origin": "https://www.binance.com",
   "referer": "https://www.binance.com/zh-CN/copy-trading",
-  "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+  "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 };
 
 const g = (o, ...ks) => { for (const k of ks) if (o && o[k] != null && o[k] !== "") return o[k]; };
@@ -30,7 +30,6 @@ function T(v) {
   return new Date(x + 288e5).toISOString().slice(0, 19).replace("T", " ");
 }
 
-// 格式化数字
 function fN(v, dec = 2) {
   const x = N(v);
   if (x == null) return "--";
@@ -38,29 +37,46 @@ function fN(v, dec = 2) {
 }
 
 async function grabAllData() {
-  const reqDetail = fetch(HOST + "bapi/futures/v1/public/future/copy-trade/lead-portfolio/detail", {
-    method: "POST", headers: H, body: JSON.stringify({ portfolioId: PID })
-  });
-  const reqPositions = fetch(HOST + "bapi/futures/v1/public/future/copy-trade/lead-portfolio/position-list", {
-    method: "POST", headers: H, body: JSON.stringify({ portfolioId: PID })
-  });
+  if (!PID) {
+    return { error: "PID 未设置，请在 Render 环境变量中配置 PID！" };
+  }
 
-  const [resDetail, resPositions] = await Promise.all([reqDetail, reqPositions]);
-  const detailJson = await resDetail.json().catch(() => ({}));
-  const posJson = await resPositions.json().catch(() => ({}));
+  try {
+    const reqDetail = fetch(HOST + "bapi/futures/v1/public/future/copy-trade/lead-portfolio/detail", {
+      method: "POST", headers: H, body: JSON.stringify({ portfolioId: PID })
+    });
+    const reqPositions = fetch(HOST + "bapi/futures/v1/public/future/copy-trade/lead-portfolio/position-list", {
+      method: "POST", headers: H, body: JSON.stringify({ portfolioId: PID })
+    });
 
-  return {
-    detail: detailJson.data || {},
-    positions: posJson.data || []
-  };
+    const [resDetail, resPositions] = await Promise.all([reqDetail, reqPositions]);
+    
+    const detailJson = await resDetail.json();
+    const posJson = await resPositions.json();
+
+    if (detailJson.code !== "000000" && detailJson.message) {
+      return { error: `币安API返回异常: ${detailJson.message} (${detailJson.code})` };
+    }
+
+    return {
+      detail: detailJson.data || {},
+      positions: posJson.data || []
+    };
+  } catch (err) {
+    return { error: `网络请求失败: ${err.message}` };
+  }
 }
 
 function buildFullMessage(data) {
+  if (data.error) {
+    return `⚠️ <b>【${NAME}】监控告警</b>\n\n<b>数据获取失败：</b> ${data.error}\n<i>请检查 Render 的 PID 环境变量设置。</i>`;
+  }
+
   const d = data.detail;
   const posList = data.positions;
 
   let text = `🦅 <b>【${NAME}】全要素持仓与实时监控</b>\n`;
-  text += `<i>推送时间：${T(Date.now())}</i>\n\n`;
+  text += `推送时间：${T(Date.now())}\n\n`;
 
   text += `📌 <b>一、 账户总览</b>\n`;
   text += `--------------------------------\n`;
@@ -84,7 +100,6 @@ function buildFullMessage(data) {
       const notional = amount * markPrice;
       const roe = margin > 0 ? ((unrealizedPnl / margin) * 100).toFixed(2) + "%" : "--";
       
-      // 推算杠杆 & 保证金比例
       const levNum = margin > 0 ? (notional / margin) : 1;
       const leverageStr = margin > 0 ? levNum.toFixed(2) + "x" : "--";
       const marginRatioStr = notional > 0 ? ((margin / notional) * 100).toFixed(2) + "%" : "--";
@@ -92,7 +107,6 @@ function buildFullMessage(data) {
       const isLong = (g(p, "positionSide") || (N(p.positionAmount) < 0 ? "SHORT" : "LONG")).includes("LONG");
       const sideText = isLong ? "🟢 多" : "🔴 空";
       
-      // 推算预估强平价
       let estLiqPrice = "--";
       if (entryPrice > 0 && levNum > 0) {
         const liqCalc = isLong 
@@ -101,10 +115,8 @@ function buildFullMessage(data) {
         estLiqPrice = (liqCalc > 0 ? liqCalc : 0).toFixed(5);
       }
 
-      // 时间处理（开仓时间 & 最近成交变动时间）
       const openTime = T(g(p, "createTime", "openTime", "updateTime"));
       const updateTime = T(g(p, "updateTime", "time"));
-
       const pnlIcon = unrealizedPnl >= 0 ? "🟢 +" : "🔴 ";
 
       text += `<b>${idx + 1}. ${p.symbol} (${sideText} | ${p.marginType || "全仓"})</b>\n`;

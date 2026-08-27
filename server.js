@@ -7,10 +7,10 @@ const NAME = process.env.NAME || "带单";
 const EP = process.env.EP || "";
 const HIST_EP = process.env.HIST_EP || "bapi/futures/v1/public/future/copy-trade/lead-portfolio/position-history";
 const DETAIL_EP = "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/detail";
-const WINDOW_MS = 4 * 60 * 1000;
 
 const HOST = "https://www.binance.com/";
 const DEF = "bapi/futures/v1/public/future/copy-trade/lead-portfolio/trade-history";
+const DASHBOARD_URL = "https://binance-leader-tracker.cyanbin96.workers.dev/";
 
 const H = {
   "content-type": "application/json",
@@ -31,11 +31,15 @@ function list(d) {
   return d.list || d.rows || d.records || d.positions || [];
 }
 
+const posState = {};
+let lastSeen = 0;
+let bootedAt = null;
+
 async function grabTrades(pageSize) {
   const path = EP || DEF;
   const r = await fetch(HOST + path, {
     method: "POST", headers: H,
-    body: JSON.stringify({ portfolioId: PID, pageNumber: 1, pageSize: pageSize || 20 })
+    body: JSON.stringify({ portfolioId: PID, pageNumber: 1, pageSize: pageSize || 30 })
   });
   const t = await r.text();
   if (!t.trim().startsWith("{")) throw new Error("HTTP " + r.status + " 非JSON");
@@ -68,33 +72,8 @@ async function getMark(symbol) {
     const t = await r.text();
     let price = null;
     try { price = N(JSON.parse(t).price); } catch (e) {}
-    return { price, raw: t.slice(0, 200) };
-  } catch (e) {
-    return { price: null, raw: "ERR " + e.message };
-  }
-}
-
-async function posListDiag() {
-  const candidates = [
-    { m: "POST", p: "bapi/futures/v1/public/future/copy-trade/lead-portfolio/position-list" },
-    { m: "POST", p: "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/position-list" },
-    { m: "GET", p: "bapi/futures/v1/public/future/copy-trade/lead-portfolio/position-list" },
-    { m: "GET", p: "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/position-list" }
-  ];
-  const out = [];
-  for (const c of candidates) {
-    try {
-      const url = HOST + c.p + (c.m === "GET" ? "?portfolioId=" + PID : "");
-      const opt = { method: c.m, headers: H };
-      if (c.m === "POST") opt.body = JSON.stringify({ portfolioId: PID });
-      const r = await fetch(url, opt);
-      const t = await r.text();
-      out.push(c.m + " " + r.status + " | " + c.p + "\n" + t.slice(0, 500));
-    } catch (e) {
-      out.push(c.m + " ERR | " + c.p + " | " + e.message);
-    }
-  }
-  return out.join("\n\n----\n\n");
+    return price;
+  } catch (e) { return null; }
 }
 
 function T(v) {
@@ -157,157 +136,156 @@ function histDetail(h) {
     "\n平仓时间 " + T(closeT);
 }
 
-function netPosition(trades) {
-  let qty = 0, avgPrice = null, openTime = null;
-  for (const t of trades) {
-    const price = N(g(t, "price", "avgPrice", "averagePrice"));
-    const tqty = Math.abs(N(g(t, "quantity", "qty", "amount", "executedQty")) || 0);
-    if (!tqty || price == null) continue;
-    const lg = isLongSide(t), op = isOpenTrade(t);
-    const dir = lg ? 1 : -1;
-    const delta = op ? dir * tqty : -dir * tqty;
-    const newQty = qty + delta;
-    if (qty === 0 || Math.sign(qty) === Math.sign(delta)) {
-      const cost = (avgPrice || 0) * Math.abs(qty) + price * tqty;
-      qty = newQty;
-      avgPrice = qty !== 0 ? cost / Math.abs(qty) : null;
-      if (openTime == null) openTime = g(t, "time", "tradeTime", "updateTime", "createTime");
-    } else if (Math.sign(newQty) === Math.sign(qty) || newQty === 0) {
-      qty = newQty;
-      if (qty === 0) { avgPrice = null; openTime = null; }
-    } else {
-      qty = newQty; avgPrice = price;
-      openTime = g(t, "time", "tradeTime", "updateTime", "createTime");
-    }
-  }
-  return { qty, avgPrice, openTime };
+function accountLine(detail) {
+  if (!detail.nickname) return "";
+  return "带单余额 " + fM(detail.marginBalance) + " USDT\n" +
+    "资产管理规模 " + fM(detail.aumAmount) + " USDT\n" +
+    "跟单用户 " + detail.currentCopyCount + "/" + detail.maxCopyCount + "\n\n";
 }
 
-function computeAllPositions(trades) {
-  const bySymbol = {};
-  for (const t of trades) {
-    const s = g(t, "symbol", "symbolName"); if (!s) continue;
-    (bySymbol[s] = bySymbol[s] || []).push(t);
-  }
-  const out = [];
-  for (const s in bySymbol) {
-    const arr = bySymbol[s].slice().reverse();
-    const pos = netPosition(arr);
-    if (pos.qty && Math.abs(pos.qty) > 1e-9) out.push({ symbol: s, ...pos });
-  }
-  return out;
-}
-
-async function posDetailComputed(pos, marginBalance) {
-  const { price: mark } = await getMark(pos.symbol);
+async function posSummary(sym, pos, marginBalance) {
+  const mark = await getMark(sym);
   const lg = pos.qty > 0;
-  const base = pos.symbol.replace(/USDT$|USDC$|BUSD$/, "");
+  const base = sym.replace(/USDT$|USDC$|BUSD$/, "");
   const notional = mark != null ? Math.abs(pos.qty) * mark : null;
   const upnl = (mark != null && pos.avgPrice != null) ? (mark - pos.avgPrice) * pos.qty : null;
   const margin = N(marginBalance);
   const roi = (upnl != null && margin) ? upnl / margin : null;
   const lev = (notional != null && margin) ? notional / margin : null;
-  const marginRatio = (margin != null && notional) ? margin / notional : null;
 
-  return (lg ? "🟢 多  " : "🔴 空  ") + pos.symbol +
+  return (lg ? "🟢 多  " : "🔴 空  ") + sym +
     "\n持仓量(" + base + ") " + fD(Math.abs(pos.qty), 2) +
     "\n持仓均价 " + fD(pos.avgPrice) +
     "\n标记价格 " + fD(mark) +
     "\n名义价值 " + fM(notional) + " USDT" +
     "\n保证金 " + fM(margin) + " USDT（全仓，账户共用）" +
-    "\n保证金比率 " + fPct(marginRatio) +
     "\n未实现盈亏 " + fSigned(upnl) + " USDT" +
     "\n回报率 " + fPct(roi) +
     "\n推算杠杆 " + (lev != null ? fD(lev, 2) + "x" : "--") +
-    "\n预估强平价 --（全仓无法精确推算）" +
     "\n开仓时间 " + T(pos.openTime);
 }
 
 async function push(text) {
+  const full = text + "\n\n🌐 " + DASHBOARD_URL;
   const r = await fetch("https://api.telegram.org/bot" + TOKEN + "/sendMessage", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: CHAT, text })
+    body: JSON.stringify({ chat_id: CHAT, text: full })
   });
   return await r.text();
 }
 
+function applyTrade(t) {
+  const sym = g(t, "symbol", "symbolName"); if (!sym) return null;
+  const price = N(g(t, "price", "avgPrice", "averagePrice"));
+  const qty = Math.abs(N(g(t, "quantity", "qty", "amount", "executedQty")) || 0);
+  if (!qty || price == null) return null;
+  const lg = isLongSide(t), op = isOpenTrade(t);
+  const dir = lg ? 1 : -1;
+  const delta = op ? dir * qty : -dir * qty;
+  const prev = posState[sym] || { qty: 0, avgPrice: null, openTime: null };
+  const newQty = prev.qty + delta;
+  let next;
+  if (prev.qty === 0 || Math.sign(prev.qty) === Math.sign(delta)) {
+    const cost = (prev.avgPrice || 0) * Math.abs(prev.qty) + price * qty;
+    next = {
+      qty: newQty,
+      avgPrice: newQty !== 0 ? cost / Math.abs(newQty) : null,
+      openTime: prev.openTime || g(t, "time", "tradeTime", "updateTime", "createTime")
+    };
+  } else if (Math.sign(newQty) === Math.sign(prev.qty) || newQty === 0) {
+    next = { qty: newQty, avgPrice: newQty === 0 ? null : prev.avgPrice, openTime: newQty === 0 ? null : prev.openTime };
+  } else {
+    next = { qty: newQty, avgPrice: price, openTime: g(t, "time", "tradeTime", "updateTime", "createTime") };
+  }
+  const wasFlat = prev.qty === 0, isFlat = next.qty === 0;
+  posState[sym] = next;
+  return { symbol: sym, trade: t, prev, next, wasFlat, isFlat };
+}
+
 async function run(force) {
-  const { arr: trades, path } = await grabTrades(1000);
-  const cut = Date.now() - WINDOW_MS;
-  const fresh = trades.filter(t => {
+  if (bootedAt == null) bootedAt = Date.now();
+  const { arr: trades, path } = await grabTrades(30);
+
+  const sorted = trades.slice().sort((a, b) => {
+    const ta = N(g(a, "time", "tradeTime", "updateTime", "createTime")) || 0;
+    const tb = N(g(b, "time", "tradeTime", "updateTime", "createTime")) || 0;
+    return ta - tb;
+  });
+
+  const firstRun = lastSeen === 0;
+  if (firstRun) {
+    let mx = 0;
+    for (const t of sorted) {
+      let x = N(g(t, "time", "tradeTime", "updateTime", "createTime"));
+      if (x == null) continue;
+      if (x < 1e12) x *= 1000;
+      if (x > mx) mx = x;
+    }
+    lastSeen = mx || Date.now();
+  }
+
+  const newTrades = sorted.filter(t => {
     let x = N(g(t, "time", "tradeTime", "updateTime", "createTime"));
     if (x == null) return false;
     if (x < 1e12) x *= 1000;
-    return x > cut;
+    return x > lastSeen;
   });
 
+  const events = [];
+  for (const t of newTrades) {
+    const ev = applyTrade(t);
+    if (ev) events.push(ev);
+    let x = N(g(t, "time", "tradeTime", "updateTime", "createTime"));
+    if (x < 1e12) x *= 1000;
+    if (x > lastSeen) lastSeen = x;
+  }
+
+  let detail = {};
+  try { detail = await grabDetail(); } catch (e) {}
+
   if (force) {
-    let detail = {}, detailErr = null;
-    try { detail = await grabDetail(); } catch (e) { detailErr = e.message; }
-    const positions = computeAllPositions(trades);
-    let markDebug = null;
-    if (positions.length) markDebug = await getMark(positions[0].symbol);
-    let msg = "连接正常（新加坡节点）\n路径 " + path + "\n\n";
-    if (detail.nickname) {
-      msg += "带单余额 " + fM(detail.marginBalance) + " USDT\n" +
-        "资产管理规模 " + fM(detail.aumAmount) + " USDT\n" +
-        "跟单用户 " + detail.currentCopyCount + "/" + detail.maxCopyCount + "\n\n";
-    }
-    if (positions.length) {
+    const known = Object.keys(posState).filter(s => posState[s].qty && Math.abs(posState[s].qty) > 1e-9);
+    let msg = "连接正常（新加坡节点）\n路径 " + path + "\n\n" + accountLine(detail);
+    msg += "追踪起始 " + T(bootedAt / 1000) + "（在此之前已存在的仓位不计入下方明细）\n\n";
+    if (known.length) {
       const parts = [];
-      for (const pos of positions) parts.push(await posDetailComputed(pos, detail.marginBalance));
-      msg += "当前持仓 (" + positions.length + ")\n\n" + parts.join("\n\n———\n\n");
+      for (const s of known) parts.push(await posSummary(s, posState[s], detail.marginBalance));
+      msg += "本次追踪到的持仓 (" + known.length + ")\n\n" + parts.join("\n\n———\n\n");
     } else {
-      msg += "当前空仓\n\n最近一笔成交:\n" + (trades.length ? lineTrade(trades[0]) : "无记录");
+      msg += "尚未追踪到仓位变动\n\n最近一笔成交:\n" + (trades.length ? lineTrade(trades[0]) : "无记录");
     }
     const tg = await push(msg);
-    return { ok: 1, path, total: trades.length, fresh: fresh.length, positions: positions.length, detailErr, markDebug, tg };
+    return { ok: 1, path, total: trades.length, newEvents: events.length, knownPositions: known.length, tg };
   }
 
-  if (!fresh.length) return { ok: 1, path, total: trades.length, fresh: 0 };
+  if (firstRun || !events.length) return { ok: 1, path, total: trades.length, newEvents: events.length, firstRun };
 
-  const opens = fresh.filter(isOpenTrade);
-  const closes = fresh.filter(t => !isOpenTrade(t));
   const parts = [];
-
-  if (opens.length) {
-    let detail = {};
-    try { detail = await grabDetail(); } catch (e) {}
-    const positions = computeAllPositions(trades);
-    const symbols = [...new Set(opens.map(t => g(t, "symbol", "symbolName")))];
-    for (const s of symbols) {
-      const p = positions.find(x => x.symbol === s);
-      parts.push(p
-        ? ("🟢 新开仓 / 加仓\n\n" + await posDetailComputed(p, detail.marginBalance))
-        : ("🟢 新开仓 " + s + "\n" + opens.filter(t => g(t, "symbol", "symbolName") === s).map(lineTrade).join("\n")));
-    }
-  }
-
-  if (closes.length) {
-    let hist = [];
-    try { hist = await grabHistory(); } catch (e) {}
-    const symbols = [...new Set(closes.map(t => g(t, "symbol", "symbolName")))];
-    for (const s of symbols) {
-      const h = hist.find(x => g(x, "symbol", "symbolName") === s);
+  for (const ev of events) {
+    if (ev.wasFlat && !ev.isFlat) {
+      parts.push("🟢 新开仓 " + ev.symbol + "\n\n" + await posSummary(ev.symbol, ev.next, detail.marginBalance));
+    } else if (!ev.isFlat) {
+      const dirTxt = Math.abs(ev.next.qty) > Math.abs(ev.prev.qty) ? "加仓" : "减仓";
+      parts.push("🟡 " + dirTxt + " " + ev.symbol + "\n\n" + await posSummary(ev.symbol, ev.next, detail.marginBalance));
+    } else {
+      let hist = [];
+      try { hist = await grabHistory(); } catch (e) {}
+      const h = hist.find(x => g(x, "symbol", "symbolName") === ev.symbol);
       parts.push(h
         ? ("🔴 平仓\n\n" + histDetail(h))
-        : ("🔴 平仓 " + s + "\n" + closes.filter(t => g(t, "symbol", "symbolName") === s).map(lineTrade).join("\n")));
+        : ("🔴 平仓 " + ev.symbol + "\n" + lineTrade(ev.trade)));
     }
   }
 
-  if (parts.length) {
-    const tg = await push("【" + NAME + "】\n\n" + parts.join("\n\n————————\n\n"));
-    return { ok: 1, path, total: trades.length, fresh: fresh.length, tg };
-  }
-  return { ok: 1, path, total: trades.length, fresh: fresh.length };
+  const tg = await push("【" + NAME + "】\n\n" + parts.join("\n\n————————\n\n"));
+  return { ok: 1, path, total: trades.length, newEvents: events.length, tg };
 }
 
 http.createServer(async (req, res) => {
   const p = req.url.split("?")[0];
   const send = (b, t) => { res.writeHead(200, { "content-type": t + "; charset=utf-8" }); res.end(b); };
   try {
-    if (p === "/poslist") return send(await posListDiag(), "text/plain");
     if (p === "/test") return send(JSON.stringify(await run(true), null, 2), "application/json");
     if (p === "/check") return send(JSON.stringify(await run(false), null, 2), "application/json");
     send("ok. /test 测试  /check 检查一次", "text/plain");

@@ -46,33 +46,44 @@ async function grabAllData() {
     const detailUrl = `${HOST}bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/detail?portfolioId=${PID}`;
     const reqDetail = fetch(detailUrl, { method: "GET", headers: H });
 
-    // 2. 获取持仓列表 (POST)，加入 baseAsset 提升兼容性
-    const posUrl = `${HOST}bapi/futures/v1/public/future/copy-trade/lead-portfolio/position-list`;
-    const reqPositions = fetch(posUrl, {
-      method: "POST", 
-      headers: H, 
-      body: JSON.stringify({ portfolioId: PID, baseAsset: "" })
-    });
+    // 2. 多路由多方式尝试抓取持仓
+    const posUrl1 = `${HOST}bapi/futures/v1/friendly/future/copy-trade/lead-data/positions?portfolioId=${PID}`;
+    const posUrl2 = `${HOST}bapi/futures/v1/public/future/copy-trade/lead-portfolio/position-list`;
 
-    const [resDetail, resPositions] = await Promise.all([reqDetail, reqPositions]);
+    const reqPos1 = fetch(posUrl1, { method: "GET", headers: H }).catch(() => null);
+    const reqPos2 = fetch(posUrl2, { method: "POST", headers: H, body: JSON.stringify({ portfolioId: PID }) }).catch(() => null);
+
+    const [resDetail, resPos1, resPos2] = await Promise.all([reqDetail, reqPos1, reqPos2]);
 
     const detailText = await resDetail.text();
-    const posText = await resPositions.text();
-
-    let detailJson = {}, posJson = {};
+    let detailJson = {};
     try { detailJson = JSON.parse(detailText); } catch (e) {}
-    try { posJson = JSON.parse(posText); } catch (e) {}
-
     const detailData = detailJson.data || {};
-    
-    // 解析持仓列表数据结构容错（币安可能返回的是数组，或是对象下的 list / positionList）
+
     let posData = [];
-    if (Array.isArray(posJson.data)) {
-      posData = posJson.data;
-    } else if (posJson.data && Array.isArray(posJson.data.list)) {
-      posData = posJson.data.list;
-    } else if (posJson.data && Array.isArray(posJson.data.positionList)) {
-      posData = posJson.data.positionList;
+
+    // 解析 API 路径 1 (GET friendly/lead-data/positions)
+    if (resPos1) {
+      try {
+        const text1 = await resPos1.text();
+        const j1 = JSON.parse(text1);
+        const list1 = j1.data || j1.data?.list || j1.data?.subPositions || j1.data?.positionList;
+        if (Array.isArray(list1) && list1.length > 0) {
+          posData = list1;
+        }
+      } catch (e) {}
+    }
+
+    // 如果路径 1 没拿到，解析路径 2 (POST position-list)
+    if (posData.length === 0 && resPos2) {
+      try {
+        const text2 = await resPos2.text();
+        const j2 = JSON.parse(text2);
+        const list2 = j2.data || j2.data?.list || j2.data?.subPositions || j2.data?.positionList;
+        if (Array.isArray(list2) && list2.length > 0) {
+          posData = list2;
+        }
+      } catch (e) {}
     }
 
     return {
@@ -114,8 +125,8 @@ function buildFullMessage(data) {
     text += `当前无持有仓位 (空仓中)\n\n`;
   } else {
     posList.forEach((p, idx) => {
-      const amount = Math.abs(N(g(p, "positionAmount", "amount", "qty", "volume")) || 0);
-      const entryPrice = N(g(p, "entryPrice", "avgPrice", "openPrice")) || 0;
+      const amount = Math.abs(N(g(p, "positionAmount", "amount", "qty", "volume", "positionQty")) || 0);
+      const entryPrice = N(g(p, "entryPrice", "avgPrice", "openPrice", "costPrice")) || 0;
       const markPrice = N(g(p, "markPrice", "price")) || entryPrice;
       const margin = N(g(p, "initialMargin", "isolatedMargin", "margin", "positionMargin")) || 0;
       const unrealizedPnl = N(g(p, "unrealizedProfit", "unrealizedPnl", "pnl", "profit")) || 0;
@@ -127,7 +138,8 @@ function buildFullMessage(data) {
       const leverageStr = margin > 0 ? levNum.toFixed(2) + "x" : "--";
       const marginRatioStr = notional > 0 ? ((margin / notional) * 100).toFixed(2) + "%" : "--";
       
-      const isLong = (g(p, "positionSide") || (N(p.positionAmount) < 0 ? "SHORT" : "LONG")).includes("LONG");
+      const sideRaw = g(p, "positionSide", "side") || (N(p.positionAmount) < 0 ? "SHORT" : "LONG");
+      const isLong = String(sideRaw).toUpperCase().includes("LONG") || String(sideRaw).toUpperCase() === "BUY";
       const sideText = isLong ? "🟢 多" : "🔴 空";
       
       let estLiqPrice = "--";

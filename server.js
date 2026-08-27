@@ -1,6 +1,6 @@
 const http = require("http");
 
-// 如果 Render 环境变量未读到，默认使用熬鹰资本的 PID
+// 如果 Render 环境变量未读到，默认使用该 PID
 const PID = process.env.PID || "5075281354358777856";
 const TOKEN = process.env.TOKEN;
 const CHAT = process.env.CHAT;
@@ -42,14 +42,16 @@ async function grabAllData() {
   }
 
   try {
-    // 关键修复：detail 接口必须用 GET 请求并拼在 URL 后面
+    // 1. 获取账户详情 (GET)
     const detailUrl = `${HOST}bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/detail?portfolioId=${PID}`;
     const reqDetail = fetch(detailUrl, { method: "GET", headers: H });
 
-    // position-list 接口保持 POST 请求
+    // 2. 获取持仓列表 (POST)，加入 baseAsset 提升兼容性
     const posUrl = `${HOST}bapi/futures/v1/public/future/copy-trade/lead-portfolio/position-list`;
     const reqPositions = fetch(posUrl, {
-      method: "POST", headers: H, body: JSON.stringify({ portfolioId: PID })
+      method: "POST", 
+      headers: H, 
+      body: JSON.stringify({ portfolioId: PID, baseAsset: "" })
     });
 
     const [resDetail, resPositions] = await Promise.all([reqDetail, reqPositions]);
@@ -62,7 +64,16 @@ async function grabAllData() {
     try { posJson = JSON.parse(posText); } catch (e) {}
 
     const detailData = detailJson.data || {};
-    const posData = posJson.data || [];
+    
+    // 解析持仓列表数据结构容错（币安可能返回的是数组，或是对象下的 list / positionList）
+    let posData = [];
+    if (Array.isArray(posJson.data)) {
+      posData = posJson.data;
+    } else if (posJson.data && Array.isArray(posJson.data.list)) {
+      posData = posJson.data.list;
+    } else if (posJson.data && Array.isArray(posJson.data.positionList)) {
+      posData = posJson.data.positionList;
+    }
 
     return {
       detail: detailData,
@@ -103,11 +114,11 @@ function buildFullMessage(data) {
     text += `当前无持有仓位 (空仓中)\n\n`;
   } else {
     posList.forEach((p, idx) => {
-      const amount = Math.abs(N(g(p, "positionAmount", "amount", "qty")) || 0);
-      const entryPrice = N(g(p, "entryPrice", "avgPrice")) || 0;
+      const amount = Math.abs(N(g(p, "positionAmount", "amount", "qty", "volume")) || 0);
+      const entryPrice = N(g(p, "entryPrice", "avgPrice", "openPrice")) || 0;
       const markPrice = N(g(p, "markPrice", "price")) || entryPrice;
-      const margin = N(g(p, "initialMargin", "isolatedMargin", "margin")) || 0;
-      const unrealizedPnl = N(g(p, "unrealizedProfit", "unrealizedPnl", "pnl")) || 0;
+      const margin = N(g(p, "initialMargin", "isolatedMargin", "margin", "positionMargin")) || 0;
+      const unrealizedPnl = N(g(p, "unrealizedProfit", "unrealizedPnl", "pnl", "profit")) || 0;
       
       const notional = amount * markPrice;
       const roe = margin > 0 ? ((unrealizedPnl / margin) * 100).toFixed(2) + "%" : "--";

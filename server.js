@@ -1,4 +1,6 @@
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
 
 const PID = process.env.PID;
 const TOKEN = process.env.TOKEN;
@@ -11,6 +13,7 @@ const DETAIL_EP = "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/det
 const HOST = "https://www.binance.com/";
 const DEF = "bapi/futures/v1/public/future/copy-trade/lead-portfolio/trade-history";
 const DASHBOARD_URL = "https://binance-leader-tracker.cyanbin96.workers.dev/";
+const STATE_FILE = path.join(__dirname, "state.json");
 
 const H = {
   "content-type": "application/json",
@@ -31,28 +34,51 @@ function list(d) {
   return d.list || d.rows || d.records || d.positions || [];
 }
 
-const posState = {};
+let posState = {};
 let lastSeen = 0;
 let bootedAt = null;
 
+function loadState() {
+  try {
+    if (!fs.existsSync(STATE_FILE)) {
+      console.log("状态文件不存在，从零开始");
+      return;
+    }
+    const s = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    posState = s.posState || {};
+    lastSeen = s.lastSeen || 0;
+    bootedAt = s.bootedAt || null;
+    console.log("已恢复状态 lastSeen=" + lastSeen + " 持仓数=" + Object.keys(posState).length);
+  } catch (e) {
+    console.log("读取状态失败:", String(e));
+  }
+}
+
+function saveState() {
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ posState, lastSeen, bootedAt }));
+  } catch (e) {
+    console.log("保存状态失败:", String(e));
+  }
+}
+
 async function grabTrades(pageSize) {
-  const path = EP || DEF;
-  const r = await fetch(HOST + path, {
+  const p = EP || DEF;
+  const r = await fetch(HOST + p, {
     method: "POST", headers: H,
-    body: JSON.stringify({ portfolioId: PID, pageNumber: 1, pageSize: pageSize || 30 })
+    body: JSON.stringify({ portfolioId: PID, pageNumber: 1, pageSize: pageSize || 100 })
   });
   const t = await r.text();
   if (!t.trim().startsWith("{")) throw new Error("HTTP " + r.status + " 非JSON");
   const j = JSON.parse(t), d = j.data ?? j;
-  return { arr: list(d), path };
+  return { arr: list(d), path: p };
 }
 
 async function grabDetail() {
   const r = await fetch(HOST + DETAIL_EP + "?portfolioId=" + PID, { method: "GET", headers: H });
   const t = await r.text();
   if (!t.trim().startsWith("{")) throw new Error("HTTP " + r.status + " 非JSON");
-  const j = JSON.parse(t);
-  return j.data ?? {};
+  return (JSON.parse(t).data ?? {});
 }
 
 async function grabHistory() {
@@ -69,10 +95,7 @@ async function grabHistory() {
 async function getMark(symbol) {
   try {
     const r = await fetch("https://fapi.binance.com/fapi/v1/ticker/price?symbol=" + symbol);
-    const t = await r.text();
-    let price = null;
-    try { price = N(JSON.parse(t).price); } catch (e) {}
-    return price;
+    return N(JSON.parse(await r.text()).price);
   } catch (e) { return null; }
 }
 
@@ -123,17 +146,12 @@ function lineTrade(t) {
 function histDetail(h) {
   const sym = g(h, "symbol", "symbolName") || "?";
   const lg = isLongSide(h);
-  const openP = g(h, "avgPrice", "entryPrice", "openPrice");
-  const closeP = g(h, "closePrice", "avgClosePrice", "closeAvgPrice");
-  const pnl = g(h, "closingPnl", "realizedPnl", "pnl", "profit");
-  const openT = g(h, "openTime", "startTime", "opened");
-  const closeT = g(h, "closeTime", "updateTime", "endTime", "closed");
   return (lg ? "🟢 多  " : "🔴 空  ") + sym + "（已平仓）" +
-    "\n开仓价 " + fD(openP) +
-    "\n平仓均价 " + fD(closeP) +
-    "\n已实现盈亏 " + fSigned(pnl) + " USDT" +
-    "\n开仓时间 " + T(openT) +
-    "\n平仓时间 " + T(closeT);
+    "\n开仓价 " + fD(g(h, "avgPrice", "entryPrice", "openPrice")) +
+    "\n平仓均价 " + fD(g(h, "closePrice", "avgClosePrice", "closeAvgPrice")) +
+    "\n已实现盈亏 " + fSigned(g(h, "closingPnl", "realizedPnl", "pnl", "profit")) + " USDT" +
+    "\n开仓时间 " + T(g(h, "openTime", "startTime", "opened")) +
+    "\n平仓时间 " + T(g(h, "closeTime", "updateTime", "endTime", "closed"));
 }
 
 function accountLine(detail) {
@@ -172,7 +190,9 @@ async function push(text) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ chat_id: CHAT, text: full })
   });
-  return await r.text();
+  const out = await r.text();
+  console.log("TG推送:", out.slice(0, 150));
+  return out;
 }
 
 function applyTrade(t) {
@@ -212,7 +232,8 @@ function applyTrade(t) {
 
 async function run(force) {
   if (bootedAt == null) bootedAt = Date.now();
-  const { arr: trades, path } = await grabTrades(30);
+  const { arr: trades, path: p } = await grabTrades(100);
+  console.log("抓到成交:", trades.length, "lastSeen:", lastSeen);
 
   const sorted = trades.slice().sort((a, b) => {
     const ta = N(g(a, "time", "tradeTime", "updateTime", "createTime")) || 0;
@@ -230,6 +251,7 @@ async function run(force) {
       if (x > mx) mx = x;
     }
     lastSeen = mx || Date.now();
+    console.log("首次运行，基准:", lastSeen);
   }
 
   const newTrades = sorted.filter(t => {
@@ -238,6 +260,7 @@ async function run(force) {
     if (x < 1e12) x *= 1000;
     return x > lastSeen;
   });
+  console.log("新成交:", newTrades.length);
 
   const events = [];
   for (const t of newTrades) {
@@ -249,11 +272,11 @@ async function run(force) {
   }
 
   let detail = {};
-  try { detail = await grabDetail(); } catch (e) {}
+  try { detail = await grabDetail(); } catch (e) { console.log("detail失败:", String(e)); }
 
   if (force) {
     const known = Object.keys(posState).filter(s => posState[s].qty && Math.abs(posState[s].qty) > 1e-9);
-    let msg = "连接正常（新加坡节点）\n路径 " + path + "\n\n" + accountLine(detail);
+    let msg = "连接正常\n路径 " + p + "\n\n" + accountLine(detail);
     msg += "追踪起始 " + T(bootedAt / 1000) + "（在此之前已存在的仓位不计入下方明细）\n\n";
     if (known.length) {
       const parts = [];
@@ -262,11 +285,15 @@ async function run(force) {
     } else {
       msg += "尚未追踪到仓位变动\n\n最近一笔成交:\n" + (trades.length ? lineTrade(trades[0]) : "无记录");
     }
-    const tg = await push(msg);
-    return { ok: 1, path, total: trades.length, newEvents: events.length, knownPositions: known.length, tg };
+    await push(msg);
+    saveState();
+    return { ok: 1, mode: "test", path: p, total: trades.length, knownPositions: known.length };
   }
 
-  if (firstRun || !events.length) return { ok: 1, path, total: trades.length, newEvents: events.length, firstRun };
+  if (firstRun || !events.length) {
+    saveState();
+    return { ok: 1, mode: "check", path: p, total: trades.length, newEvents: events.length, firstRun };
+  }
 
   const parts = [];
   for (const ev of events) {
@@ -279,15 +306,20 @@ async function run(force) {
       let hist = [];
       try { hist = await grabHistory(); } catch (e) {}
       const h = hist.find(x => g(x, "symbol", "symbolName") === ev.symbol);
-      parts.push(h
-        ? ("🔴 平仓\n\n" + histDetail(h))
-        : ("🔴 平仓 " + ev.symbol + "\n" + lineTrade(ev.trade)));
+      parts.push(h ? ("🔴 平仓\n\n" + histDetail(h)) : ("🔴 平仓 " + ev.symbol + "\n" + lineTrade(ev.trade)));
     }
   }
 
-  const tg = await push("【" + NAME + "】\n\n" + parts.join("\n\n————————\n\n"));
-  return { ok: 1, path, total: trades.length, newEvents: events.length, tg };
+  await push("【" + NAME + "】\n\n" + parts.join("\n\n————————\n\n"));
+  saveState();
+  return { ok: 1, mode: "check", path: p, total: trades.length, newEvents: events.length };
 }
+
+loadState();
+
+setInterval(() => {
+  run(false).catch(e => console.log("定时任务出错:", String(e.message || e)));
+}, 120000);
 
 http.createServer(async (req, res) => {
   const p = req.url.split("?")[0];
@@ -295,7 +327,11 @@ http.createServer(async (req, res) => {
   try {
     if (p === "/test") return send(JSON.stringify(await run(true), null, 2), "application/json");
     if (p === "/check") return send(JSON.stringify(await run(false), null, 2), "application/json");
-    send("ok. /test 测试  /check 检查一次", "text/plain");
+    if (p === "/reset") {
+      posState = {}; lastSeen = 0; bootedAt = null; saveState();
+      return send(JSON.stringify({ ok: 1, msg: "状态已清空" }), "application/json");
+    }
+    send("ok. /test 测试  /check 检查  /reset 清空状态", "text/plain");
   } catch (e) {
     res.writeHead(500, { "content-type": "application/json; charset=utf-8" });
     res.end(JSON.stringify({ ok: 0, err: String(e.message || e) }, null, 2));

@@ -181,9 +181,16 @@ function applyTrade(t) {
   const qty = Math.abs(N(g(t, "quantity", "qty", "amount", "executedQty")) || 0);
   if (!qty || price == null) return null;
   const lg = isLongSide(t), op = isOpenTrade(t);
+  const prev = posState[sym] || { qty: 0, avgPrice: null, openTime: null };
+
+  if (!op && prev.qty === 0) {
+    const next = { qty: 0, avgPrice: null, openTime: null };
+    posState[sym] = next;
+    return { symbol: sym, trade: t, prev, next, wasFlat: true, isFlat: true };
+  }
+
   const dir = lg ? 1 : -1;
   const delta = op ? dir * qty : -dir * qty;
-  const prev = posState[sym] || { qty: 0, avgPrice: null, openTime: null };
   const newQty = prev.qty + delta;
   let next;
   if (prev.qty === 0 || Math.sign(prev.qty) === Math.sign(delta)) {

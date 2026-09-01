@@ -9,7 +9,6 @@ const NAME = process.env.NAME || "带单";
 const EP = process.env.EP || "";
 const HIST_EP = process.env.HIST_EP || "bapi/futures/v1/public/future/copy-trade/lead-portfolio/position-history";
 const DETAIL_EP = "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/detail";
-const POS_EP = "bapi/futures/v1/public/future/copy-trade/lead-portfolio/position";
 
 const HOST = "https://www.binance.com/";
 const DEF = "bapi/futures/v1/public/future/copy-trade/lead-portfolio/trade-history";
@@ -55,6 +54,41 @@ function saveState() {
   catch (e) { console.log("保存状态失败:", String(e)); }
 }
 
+const CANDIDATES = [
+  "bapi/futures/v1/public/future/copy-trade/lead-portfolio/position",
+  "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/position",
+  "bapi/futures/v1/public/future/copy-trade/lead-portfolio/positions",
+  "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/positions",
+  "bapi/futures/v1/public/future/copy-trade/lead-portfolio/current-position",
+  "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/current-position",
+  "bapi/futures/v1/public/future/copy-trade/lead-portfolio/position-list",
+  "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/position-list",
+  "bapi/futures/v1/public/future/copy-trade/lead-data/positions",
+  "bapi/futures/v1/friendly/future/copy-trade/lead-data/positions",
+  "bapi/futures/v1/public/future/copy-trade/lead-portfolio/open-position",
+  "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/open-position"
+];
+
+async function probe() {
+  const out = [];
+  for (const c of CANDIDATES) {
+    for (const method of ["GET", "POST"]) {
+      try {
+        const opt = method === "GET"
+          ? { method: "GET", headers: H }
+          : { method: "POST", headers: H, body: JSON.stringify({ portfolioId: PID, pageNumber: 1, pageSize: 50 }) };
+        const url = method === "GET" ? HOST + c + "?portfolioId=" + PID : HOST + c;
+        const r = await fetch(url, opt);
+        const t = await r.text();
+        out.push({ path: c, method, status: r.status, preview: t.slice(0, 300) });
+      } catch (e) {
+        out.push({ path: c, method, error: String(e.message || e) });
+      }
+    }
+  }
+  return out;
+}
+
 async function grabTrades(pageSize) {
   const p = EP || DEF;
   const r = await fetch(HOST + p, {
@@ -65,13 +99,6 @@ async function grabTrades(pageSize) {
   if (!t.trim().startsWith("{")) throw new Error("HTTP " + r.status + " 非JSON");
   const j = JSON.parse(t), d = j.data ?? j;
   return { arr: list(d), path: p };
-}
-
-async function grabPositions() {
-  const r = await fetch(HOST + POS_EP + "?portfolioId=" + PID, { method: "GET", headers: H });
-  const t = await r.text();
-  if (!t.trim().startsWith("{")) throw new Error("HTTP " + r.status + " 非JSON: " + t.slice(0, 200));
-  return JSON.parse(t);
 }
 
 async function grabDetail() {
@@ -353,12 +380,12 @@ http.createServer(async (req, res) => {
   try {
     if (p === "/test") return send(JSON.stringify(await run(true), null, 2), "application/json");
     if (p === "/check") return send(JSON.stringify(await run(false), null, 2), "application/json");
-    if (p === "/pos") return send(JSON.stringify(await grabPositions(), null, 2), "application/json");
+    if (p === "/probe") return send(JSON.stringify(await probe(), null, 2), "application/json");
     if (p === "/reset") {
       posState = {}; lastSeen = 0; bootedAt = null; saveState();
       return send(JSON.stringify({ ok: 1, msg: "状态已清空" }), "application/json");
     }
-    send("ok. /test 测试  /check 检查  /pos 持仓原始数据  /reset 清空状态", "text/plain");
+    send("ok. /test 测试  /check 检查  /probe 探测接口  /reset 清空状态", "text/plain");
   } catch (e) {
     res.writeHead(500, { "content-type": "application/json; charset=utf-8" });
     res.end(JSON.stringify({ ok: 0, err: String(e.message || e) }, null, 2));

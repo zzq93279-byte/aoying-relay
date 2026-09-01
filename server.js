@@ -9,6 +9,7 @@ const NAME = process.env.NAME || "带单";
 const EP = process.env.EP || "";
 const HIST_EP = process.env.HIST_EP || "bapi/futures/v1/public/future/copy-trade/lead-portfolio/position-history";
 const DETAIL_EP = "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/detail";
+const POS_EP = "bapi/futures/v1/public/future/copy-trade/lead-portfolio/position";
 
 const HOST = "https://www.binance.com/";
 const DEF = "bapi/futures/v1/public/future/copy-trade/lead-portfolio/trade-history";
@@ -40,26 +41,18 @@ let bootedAt = null;
 
 function loadState() {
   try {
-    if (!fs.existsSync(STATE_FILE)) {
-      console.log("状态文件不存在，从零开始");
-      return;
-    }
+    if (!fs.existsSync(STATE_FILE)) { console.log("状态文件不存在，从零开始"); return; }
     const s = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
     posState = s.posState || {};
     lastSeen = s.lastSeen || 0;
     bootedAt = s.bootedAt || null;
     console.log("已恢复状态 lastSeen=" + lastSeen + " 持仓数=" + Object.keys(posState).length);
-  } catch (e) {
-    console.log("读取状态失败:", String(e));
-  }
+  } catch (e) { console.log("读取状态失败:", String(e)); }
 }
 
 function saveState() {
-  try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify({ posState, lastSeen, bootedAt }));
-  } catch (e) {
-    console.log("保存状态失败:", String(e));
-  }
+  try { fs.writeFileSync(STATE_FILE, JSON.stringify({ posState, lastSeen, bootedAt })); }
+  catch (e) { console.log("保存状态失败:", String(e)); }
 }
 
 async function grabTrades(pageSize) {
@@ -72,6 +65,13 @@ async function grabTrades(pageSize) {
   if (!t.trim().startsWith("{")) throw new Error("HTTP " + r.status + " 非JSON");
   const j = JSON.parse(t), d = j.data ?? j;
   return { arr: list(d), path: p };
+}
+
+async function grabPositions() {
+  const r = await fetch(HOST + POS_EP + "?portfolioId=" + PID, { method: "GET", headers: H });
+  const t = await r.text();
+  if (!t.trim().startsWith("{")) throw new Error("HTTP " + r.status + " 非JSON: " + t.slice(0, 200));
+  return JSON.parse(t);
 }
 
 async function grabDetail() {
@@ -230,6 +230,28 @@ function applyTrade(t) {
   return { symbol: sym, trade: t, prev, next, wasFlat, isFlat };
 }
 
+function mergeEvents(events) {
+  const bySymbol = new Map();
+  for (const ev of events) {
+    if (!bySymbol.has(ev.symbol)) {
+      bySymbol.set(ev.symbol, { symbol: ev.symbol, first: ev, last: ev, count: 1 });
+    } else {
+      const m = bySymbol.get(ev.symbol);
+      m.last = ev;
+      m.count++;
+    }
+  }
+  return Array.from(bySymbol.values()).map(m => ({
+    symbol: m.symbol,
+    trade: m.last.trade,
+    prev: m.first.prev,
+    next: m.last.next,
+    wasFlat: m.first.wasFlat,
+    isFlat: m.last.isFlat,
+    count: m.count
+  }));
+}
+
 async function run(force) {
   if (bootedAt == null) bootedAt = Date.now();
   const { arr: trades, path: p } = await grabTrades(100);
@@ -262,14 +284,17 @@ async function run(force) {
   });
   console.log("新成交:", newTrades.length);
 
-  const events = [];
+  const rawEvents = [];
   for (const t of newTrades) {
     const ev = applyTrade(t);
-    if (ev) events.push(ev);
+    if (ev) rawEvents.push(ev);
     let x = N(g(t, "time", "tradeTime", "updateTime", "createTime"));
     if (x < 1e12) x *= 1000;
     if (x > lastSeen) lastSeen = x;
   }
+
+  const events = mergeEvents(rawEvents);
+  console.log("原始事件:", rawEvents.length, "合并后:", events.length);
 
   let detail = {};
   try { detail = await grabDetail(); } catch (e) { console.log("detail失败:", String(e)); }
@@ -292,27 +317,28 @@ async function run(force) {
 
   if (firstRun || !events.length) {
     saveState();
-    return { ok: 1, mode: "check", path: p, total: trades.length, newEvents: events.length, firstRun };
+    return { ok: 1, mode: "check", path: p, total: trades.length, newEvents: 0, firstRun };
   }
 
   const parts = [];
   for (const ev of events) {
+    const tag = ev.count > 1 ? "（" + ev.count + "笔成交合并）" : "";
     if (ev.wasFlat && !ev.isFlat) {
-      parts.push("🟢 新开仓 " + ev.symbol + "\n\n" + await posSummary(ev.symbol, ev.next, detail.marginBalance));
+      parts.push("🟢 新开仓 " + ev.symbol + tag + "\n\n" + await posSummary(ev.symbol, ev.next, detail.marginBalance));
     } else if (!ev.isFlat) {
       const dirTxt = Math.abs(ev.next.qty) > Math.abs(ev.prev.qty) ? "加仓" : "减仓";
-      parts.push("🟡 " + dirTxt + " " + ev.symbol + "\n\n" + await posSummary(ev.symbol, ev.next, detail.marginBalance));
+      parts.push("🟡 " + dirTxt + " " + ev.symbol + tag + "\n\n" + await posSummary(ev.symbol, ev.next, detail.marginBalance));
     } else {
       let hist = [];
       try { hist = await grabHistory(); } catch (e) {}
       const h = hist.find(x => g(x, "symbol", "symbolName") === ev.symbol);
-      parts.push(h ? ("🔴 平仓\n\n" + histDetail(h)) : ("🔴 平仓 " + ev.symbol + "\n" + lineTrade(ev.trade)));
+      parts.push(h ? ("🔴 平仓" + tag + "\n\n" + histDetail(h)) : ("🔴 平仓 " + ev.symbol + tag + "\n" + lineTrade(ev.trade)));
     }
   }
 
   await push("【" + NAME + "】\n\n" + parts.join("\n\n————————\n\n"));
   saveState();
-  return { ok: 1, mode: "check", path: p, total: trades.length, newEvents: events.length };
+  return { ok: 1, mode: "check", path: p, total: trades.length, rawEvents: rawEvents.length, mergedEvents: events.length };
 }
 
 loadState();
@@ -327,11 +353,12 @@ http.createServer(async (req, res) => {
   try {
     if (p === "/test") return send(JSON.stringify(await run(true), null, 2), "application/json");
     if (p === "/check") return send(JSON.stringify(await run(false), null, 2), "application/json");
+    if (p === "/pos") return send(JSON.stringify(await grabPositions(), null, 2), "application/json");
     if (p === "/reset") {
       posState = {}; lastSeen = 0; bootedAt = null; saveState();
       return send(JSON.stringify({ ok: 1, msg: "状态已清空" }), "application/json");
     }
-    send("ok. /test 测试  /check 检查  /reset 清空状态", "text/plain");
+    send("ok. /test 测试  /check 检查  /pos 持仓原始数据  /reset 清空状态", "text/plain");
   } catch (e) {
     res.writeHead(500, { "content-type": "application/json; charset=utf-8" });
     res.end(JSON.stringify({ ok: 0, err: String(e.message || e) }, null, 2));

@@ -9,7 +9,6 @@ const NAME = process.env.NAME || "带单";
 const EP = process.env.EP || "";
 const HIST_EP = process.env.HIST_EP || "bapi/futures/v1/public/future/copy-trade/lead-portfolio/position-history";
 const DETAIL_EP = "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/detail";
-const POS_PATH = "bapi/futures/v1/public/future/copy-trade/lead-data/positions";
 
 const HOST = "https://www.binance.com/";
 const DEF = "bapi/futures/v1/public/future/copy-trade/lead-portfolio/trade-history";
@@ -38,6 +37,7 @@ function list(d) {
 let posState = {};
 let lastSeen = 0;
 let bootedAt = null;
+const markCache = {};
 
 function loadState() {
   try {
@@ -53,52 +53,6 @@ function loadState() {
 function saveState() {
   try { fs.writeFileSync(STATE_FILE, JSON.stringify({ posState, lastSeen, bootedAt })); }
   catch (e) { console.log("保存状态失败:", String(e)); }
-}
-
-async function probe2() {
-  const out = [];
-
-  const getParams = [
-    "portfolioId=" + PID,
-    "leadPortfolioId=" + PID,
-    "portfolioId=" + PID + "&pageNumber=1&pageSize=50",
-    "leadPortfolioId=" + PID + "&pageNumber=1&pageSize=50",
-    "portfolioId=" + PID + "&userId=" + PID,
-    "id=" + PID
-  ];
-
-  for (const q of getParams) {
-    try {
-      const r = await fetch(HOST + POS_PATH + "?" + q, { method: "GET", headers: H });
-      const t = await r.text();
-      out.push({ type: "GET", query: q, status: r.status, preview: t.slice(0, 400) });
-    } catch (e) {
-      out.push({ type: "GET", query: q, error: String(e.message || e) });
-    }
-  }
-
-  const postBodies = [
-    { portfolioId: PID },
-    { leadPortfolioId: PID },
-    { portfolioId: PID, pageNumber: 1, pageSize: 50 },
-    { leadPortfolioId: PID, pageNumber: 1, pageSize: 50 },
-    { portfolioId: String(PID) },
-    { portfolioId: Number(PID) }
-  ];
-
-  for (const b of postBodies) {
-    try {
-      const r = await fetch(HOST + POS_PATH, {
-        method: "POST", headers: H, body: JSON.stringify(b)
-      });
-      const t = await r.text();
-      out.push({ type: "POST", body: JSON.stringify(b), status: r.status, preview: t.slice(0, 400) });
-    } catch (e) {
-      out.push({ type: "POST", body: JSON.stringify(b), error: String(e.message || e) });
-    }
-  }
-
-  return out;
 }
 
 async function grabTrades(pageSize) {
@@ -131,11 +85,48 @@ async function grabHistory() {
   return list(d);
 }
 
-async function getMark(symbol) {
+async function tryFetchPrice(url, extract) {
   try {
-    const r = await fetch("https://fapi.binance.com/fapi/v1/ticker/price?symbol=" + symbol);
-    return N(JSON.parse(await r.text()).price);
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const j = JSON.parse(await r.text());
+    return extract(j);
   } catch (e) { return null; }
+}
+
+async function getMark(symbol) {
+  const cached = markCache[symbol];
+  if (cached && Date.now() - cached.at < 60000) return cached.price;
+
+  let price = await tryFetchPrice(
+    "https://fapi.binance.com/fapi/v1/premiumIndex?symbol=" + symbol,
+    j => N(j.markPrice)
+  );
+
+  if (price == null) {
+    price = await tryFetchPrice(
+      "https://fapi.binance.com/fapi/v1/ticker/price?symbol=" + symbol,
+      j => N(j.price)
+    );
+  }
+
+  if (price == null) {
+    price = await tryFetchPrice(
+      "https://api.binance.com/api/v3/ticker/price?symbol=" + symbol,
+      j => N(j.price)
+    );
+  }
+
+  if (price == null) {
+    price = await tryFetchPrice(
+      "https://dapi.binance.com/dapi/v1/ticker/price?symbol=" + symbol,
+      j => (Array.isArray(j) && j.length ? N(j[0].price) : null)
+    );
+  }
+
+  if (price != null) markCache[symbol] = { price, at: Date.now() };
+  else console.log("取不到标记价:", symbol);
+  return price;
 }
 
 function T(v) {
@@ -169,15 +160,36 @@ function isOpenTrade(t) {
   return sd === "BUY" ? !ps.includes("SHORT") : ps.includes("SHORT");
 }
 
+function realQty(t) {
+  const price = N(g(t, "price", "avgPrice", "averagePrice"));
+  const rawQty = Math.abs(N(g(t, "quantity", "qty", "amount", "executedQty")) || 0);
+  const quote = N(g(t, "quoteQty", "notional", "notionalValue", "turnover"));
+
+  if (quote != null && price) {
+    const derived = Math.abs(quote / price);
+    if (rawQty && Math.abs(rawQty - derived) / Math.max(rawQty, derived) < 0.02) {
+      return rawQty;
+    }
+    return derived;
+  }
+
+  if (rawQty && price) {
+    const derived = rawQty / price;
+    if (rawQty / derived > 100) return derived;
+  }
+
+  return rawQty;
+}
+
 function lineTrade(t) {
   const s = g(t, "symbol", "symbolName") || "?";
   const lg = isLongSide(t), op = isOpenTrade(t);
   const pr = N(g(t, "price", "avgPrice", "averagePrice"));
-  const q = Math.abs(N(g(t, "quantity", "qty", "amount", "executedQty")) || 0);
+  const q = realQty(t);
   let qv = N(g(t, "quoteQty", "notional", "notionalValue", "turnover"));
   if (qv == null && pr != null) qv = pr * q;
   return (op ? "🟢 " : "🔴 ") + (op ? "开" : "平") + (lg ? "多" : "空") + "  " + s +
-    "\n均价 " + (pr ?? "--") + "   数量 " + q.toLocaleString("en-US") +
+    "\n均价 " + fD(pr) + "   数量 " + fD(q, 3) +
     "\n名义 " + (qv != null ? Math.round(qv).toLocaleString("en-US") : "--") + " USDT" +
     "\n" + T(g(t, "time", "tradeTime", "updateTime", "createTime"));
 }
@@ -237,7 +249,7 @@ async function push(text) {
 function applyTrade(t) {
   const sym = g(t, "symbol", "symbolName"); if (!sym) return null;
   const price = N(g(t, "price", "avgPrice", "averagePrice"));
-  const qty = Math.abs(N(g(t, "quantity", "qty", "amount", "executedQty")) || 0);
+  const qty = realQty(t);
   if (!qty || price == null) return null;
   const lg = isLongSide(t), op = isOpenTrade(t);
   const prev = posState[sym] || { qty: 0, avgPrice: null, openTime: null };
@@ -392,12 +404,11 @@ http.createServer(async (req, res) => {
   try {
     if (p === "/test") return send(JSON.stringify(await run(true), null, 2), "application/json");
     if (p === "/check") return send(JSON.stringify(await run(false), null, 2), "application/json");
-    if (p === "/probe2") return send(JSON.stringify(await probe2(), null, 2), "application/json");
     if (p === "/reset") {
       posState = {}; lastSeen = 0; bootedAt = null; saveState();
       return send(JSON.stringify({ ok: 1, msg: "状态已清空" }), "application/json");
     }
-    send("ok. /test 测试  /check 检查  /probe2 参数探测  /reset 清空状态", "text/plain");
+    send("ok. /test 测试  /check 检查  /reset 清空状态", "text/plain");
   } catch (e) {
     res.writeHead(500, { "content-type": "application/json; charset=utf-8" });
     res.end(JSON.stringify({ ok: 0, err: String(e.message || e) }, null, 2));

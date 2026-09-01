@@ -9,6 +9,7 @@ const NAME = process.env.NAME || "带单";
 const EP = process.env.EP || "";
 const HIST_EP = process.env.HIST_EP || "bapi/futures/v1/public/future/copy-trade/lead-portfolio/position-history";
 const DETAIL_EP = "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/detail";
+const POS_PATH = "bapi/futures/v1/public/future/copy-trade/lead-data/positions";
 
 const HOST = "https://www.binance.com/";
 const DEF = "bapi/futures/v1/public/future/copy-trade/lead-portfolio/trade-history";
@@ -54,38 +55,49 @@ function saveState() {
   catch (e) { console.log("保存状态失败:", String(e)); }
 }
 
-const CANDIDATES = [
-  "bapi/futures/v1/public/future/copy-trade/lead-portfolio/position",
-  "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/position",
-  "bapi/futures/v1/public/future/copy-trade/lead-portfolio/positions",
-  "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/positions",
-  "bapi/futures/v1/public/future/copy-trade/lead-portfolio/current-position",
-  "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/current-position",
-  "bapi/futures/v1/public/future/copy-trade/lead-portfolio/position-list",
-  "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/position-list",
-  "bapi/futures/v1/public/future/copy-trade/lead-data/positions",
-  "bapi/futures/v1/friendly/future/copy-trade/lead-data/positions",
-  "bapi/futures/v1/public/future/copy-trade/lead-portfolio/open-position",
-  "bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/open-position"
-];
-
-async function probe() {
+async function probe2() {
   const out = [];
-  for (const c of CANDIDATES) {
-    for (const method of ["GET", "POST"]) {
-      try {
-        const opt = method === "GET"
-          ? { method: "GET", headers: H }
-          : { method: "POST", headers: H, body: JSON.stringify({ portfolioId: PID, pageNumber: 1, pageSize: 50 }) };
-        const url = method === "GET" ? HOST + c + "?portfolioId=" + PID : HOST + c;
-        const r = await fetch(url, opt);
-        const t = await r.text();
-        out.push({ path: c, method, status: r.status, preview: t.slice(0, 300) });
-      } catch (e) {
-        out.push({ path: c, method, error: String(e.message || e) });
-      }
+
+  const getParams = [
+    "portfolioId=" + PID,
+    "leadPortfolioId=" + PID,
+    "portfolioId=" + PID + "&pageNumber=1&pageSize=50",
+    "leadPortfolioId=" + PID + "&pageNumber=1&pageSize=50",
+    "portfolioId=" + PID + "&userId=" + PID,
+    "id=" + PID
+  ];
+
+  for (const q of getParams) {
+    try {
+      const r = await fetch(HOST + POS_PATH + "?" + q, { method: "GET", headers: H });
+      const t = await r.text();
+      out.push({ type: "GET", query: q, status: r.status, preview: t.slice(0, 400) });
+    } catch (e) {
+      out.push({ type: "GET", query: q, error: String(e.message || e) });
     }
   }
+
+  const postBodies = [
+    { portfolioId: PID },
+    { leadPortfolioId: PID },
+    { portfolioId: PID, pageNumber: 1, pageSize: 50 },
+    { leadPortfolioId: PID, pageNumber: 1, pageSize: 50 },
+    { portfolioId: String(PID) },
+    { portfolioId: Number(PID) }
+  ];
+
+  for (const b of postBodies) {
+    try {
+      const r = await fetch(HOST + POS_PATH, {
+        method: "POST", headers: H, body: JSON.stringify(b)
+      });
+      const t = await r.text();
+      out.push({ type: "POST", body: JSON.stringify(b), status: r.status, preview: t.slice(0, 400) });
+    } catch (e) {
+      out.push({ type: "POST", body: JSON.stringify(b), error: String(e.message || e) });
+    }
+  }
+
   return out;
 }
 
@@ -380,12 +392,12 @@ http.createServer(async (req, res) => {
   try {
     if (p === "/test") return send(JSON.stringify(await run(true), null, 2), "application/json");
     if (p === "/check") return send(JSON.stringify(await run(false), null, 2), "application/json");
-    if (p === "/probe") return send(JSON.stringify(await probe(), null, 2), "application/json");
+    if (p === "/probe2") return send(JSON.stringify(await probe2(), null, 2), "application/json");
     if (p === "/reset") {
       posState = {}; lastSeen = 0; bootedAt = null; saveState();
       return send(JSON.stringify({ ok: 1, msg: "状态已清空" }), "application/json");
     }
-    send("ok. /test 测试  /check 检查  /probe 探测接口  /reset 清空状态", "text/plain");
+    send("ok. /test 测试  /check 检查  /probe2 参数探测  /reset 清空状态", "text/plain");
   } catch (e) {
     res.writeHead(500, { "content-type": "application/json; charset=utf-8" });
     res.end(JSON.stringify({ ok: 0, err: String(e.message || e) }, null, 2));
